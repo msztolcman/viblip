@@ -1,18 +1,18 @@
 " File: blip.vim
 " Description: Posting statuses to Blip!
 " Maintainer: Marcin Sztolcman <marcin@urzenia.net>
-" Version: v0.2
-" Date: 2008.12.20
+" Version: v0.3
+" Date: 2009.03.12
 " Info: $Id$
 " History:
+" 0.3 better checking for python feature
 " 0.2 Methods for read private messages or single status, and some fixes
 " 0.1 Initial upload to vim.org
 " ------------------------------------------------------------------------------
 
 if !has('python')
     echo "Error: Required vim compiled with +python"
-    finish
-endif
+else
 
 python << EOF
 
@@ -47,7 +47,7 @@ class ViBlip (object):
             'X-Blip-api':       '0.02',
             'Accept':           'application/json',
             'Content-type':     'application/json',
-            'User-Agent':       'ViBlip/' + self.version + '(http://www.vim.org/scripts/script.php?script_id=2492)',
+            'User-Agent':       'ViBlip/' + self.version + ' (http://www.vim.org/scripts/script.php?script_id=2492)',
             'Authorization':    'Basic ' + base64.encodestring ('%s:%s' % (self.user, self.passwd)).rstrip (),
         }
 
@@ -81,7 +81,7 @@ class ViBlip (object):
     def dashboard (self):
         url = '/dashboard'
         if vim.eval ('a:1'):
-        	url = '/users/' + vim.eval ('a:1') + url
+            url = '/users/' + vim.eval ('a:1') + url
 
         try:
             self.conn.request ('GET', url, None, self.headers)
@@ -125,9 +125,9 @@ class ViBlip (object):
     def private (self):
         url = '/private_messages?limit='
         if vim.eval ('a:1'):
-        	url += vim.eval ('a:1')
+            url += vim.eval ('a:1')
         else:
-        	url += '5'
+            url += '5'
 
         try:
             self.conn.request ('GET', url, None, self.headers)
@@ -233,3 +233,4 @@ function! ViBlipMessage(...)
 endfunction
 command! -nargs=1 MBlip call ViBlipMessage (<q-args>)
 
+endif
