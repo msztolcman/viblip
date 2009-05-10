@@ -89,7 +89,7 @@ class ViBlip (object):
                 print response.status, response.reason
                 return
 
-            print 'Status OK:', response.getheader ('Location', '').replace ('/updates/', '/s/')
+            print 'Status OK:', response.getheader ('Location', '').replace ('/api.', '/').replace ('/updates/', '/s/')
             return True
 
         except Exception, e:
