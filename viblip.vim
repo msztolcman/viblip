@@ -1,10 +1,12 @@
 " File: blip.vim
 " Description: Posting statuses to Blip!
 " Maintainer: Marcin Sztolcman <marcin@urzenia.net>
-" Version: v0.4
+" Version: v0.5
 " Date: 2009.05.10
-" Info: $Id$
+" Info: $Id: viblip.vim -1   $
 " History:
+" 0.5   - Completely new plugin
+"       - network part based on blipapi.py (http://blipapi.googlecode.com)
 " 0.4   - Rewrite some parts of code
 "       - ability to use json module
 "       - new command: RBlip - reconnecting
@@ -17,234 +19,285 @@
 " 0.1 Initial upload to vim.org
 " ------------------------------------------------------------------------------
 
-if !has('python')
+if !has ('python')
+    echohl ErrorMsg
     echo "Error: Required vim compiled with +python"
-else
+    echohl None
+    finish
+endif
+
+if exists ('loaded_viblip')
+" FIXME: wlaczyc blokade!!!
+"     finish
+endif
+let loaded_viblip = 1
 
 python << EOF
-
-import base64
-import httplib
-import os, os.path
-import re
-
 import vim
 
-class ViBlipError (Exception):
-    pass
+import copy
+import httplib
+import os.path
+import random
 
-class ViBlip (object):
-    version     = '0.4'
-    rxp_raw2utf = re.compile (r'\\u[a-z0-9]{4}')
-    parser      = None
+def gen_boundary ():
+    return 'BlipApi.py-'+"".join ([random.choice ('0123456789abcdefghijklmnopqrstuvwxyz') for i in range (18)])
 
-    def __init__ (self):
-        self.user        = None
-        self.passwd      = None
-        self.conn        = None
+def make_post_data (fields, boundary=None, sep="\r\n"):
+    if type (fields) is not dict:   fields = dict (fields)
+    if not boundary:                boundary = gen_boundary ()
 
+    output = []
+    for k, v in fields.items ():
+        output.append ( '--' + boundary )
+        output.append ('Content-Disposition: form-data; name="' + k + '"')
+        output.append ('')
+        output.append (v.encode ('utf-8', 'ignore'))
+
+    output.append ( '--' + boundary + '--' )
+    output.append ('')
+    return (sep.join (output), boundary)
+
+class BlipApiError (Exception): pass
+
+class BlipApiDashboard (object):
+    def read (since_id=None, include=None, limit=10, offset=0):
+        url = '/dashboard'
+        if since_id:
+            url += '/since/' + str (since_id)
+
+        params = list ()
+        if limit:   params.append ('limit=' + str (limit))
+        if offset:  params.append ('offset=' + str (offset))
+        if include: params.append ('include=' + urllib.quote_plus (','.join (include), ','))
+        if params:  url += '?' + '&'.join (params)
+
+        return dict (url = url, method = 'get')
+    read = staticmethod (read)
+
+class BlipApiDirmsg (object):
+    def create (body, user):
+        fields = {
+            'directed_message[body]':      body,
+            'directed_message[recipient]': user,
+        }
+        data, boundary = make_post_data (fields)
+        return dict (
+            url         = '/directed_messages',
+            method      = 'post',
+            data        = data,
+            boundary    = boundary,
+        )
+    create = staticmethod (create)
+
+    def read (id, include=None, ):
+        url = '/directed_messages/' + str (id)
+        if include:
+            url += '?include=' + urllib.quote_plus (','.join (include), ',')
+        return dict (url = url, method = 'get')
+    read = staticmethod (read)
+
+    def delete (id):
+        return dict (url = '/directed_messages/' + str (id), method = 'delete')
+    delete = staticmethod (delete)
+
+class BlipApiPrivmsg (object):
+    def create (body=None, user=None):
+        fields = {
+            'private_message[body]':      body,
+            'private_message[recipient]': user,
+        }
+        data, boundary = make_post_data (fields)
+        return dict (
+            url         = '/private_messages',
+            method      = 'post',
+            data        = data,
+            boundary    = boundary,
+        )
+    create = staticmethod (create)
+
+    def read (id, include=None):
+        url = '/private_messages/' + str (id)
+        if include:
+            url += '?include=' + urllib.quote_plus (','.join (include), ',')
+        return dict (url = url, method = 'get')
+    read = staticmethod (read)
+
+    def delete (id):
+        return dict (url = '/private_messages/' + str (id), method = 'delete')
+    delete = staticmethod (delete)
+
+class BlipApiStatus (object):
+    def create (body):
+        data, boundary = make_post_data ( { 'status[body]': body, } )
+        return dict (
+            url         = '/statuses',
+            method      = 'post',
+            data        = data,
+            boundary    = boundary,
+        )
+    create = staticmethod (create)
+
+    def read (id, include=None):
+        url = '/statuses/' + str (id)
+        if include:
+            url += '?include=' + urllib.quote_plus (','.join (include), ',')
+        return dict (url = url, method = 'get')
+    read = staticmethod (read)
+
+    def delete (id):
+        return dict (url = '/statuses/' + str (id), method = 'delete')
+    delete = staticmethod (delete)
+
+
+class BlipApi (object):
+    version = '0.5'
+    _modules = dict (
+        dashboard   = BlipApiDashboard,
+        dirmsg      = BlipApiDirmsg,
+        privmsg     = BlipApiPrivmsg,
+        status      = BlipApiStatus,
+    )
+
+    ## debug
+    def __debug_get (self):
+        return self._debug
+    def __debug_set (self, level):
+        if not type (level) is int or level < 0:
+            level = 0
+        self._debug = level
+        self._ch.set_debuglevel (level)
+    def __debug_del (self):
+        self.debug = 0
+    debug = property (__debug_get, __debug_set, __debug_del)
+
+    def __init__ (self, login=None, passwd=None):
+        self._login     = login
+        self._password  = passwd
+        self._debug     = 0
+        self._parser    = None
+        self._headers   = {
+            'Accept':       'application/json',
+            'X-Blip-API':   '0.02',
+            'User-Agent':   'ViBlip/' + self.version + ' (http://www.vim.org/scripts/script.php?script_id=2492)',
+        }
+
+        ## json
         try:
             import json
-            self.parser = json.loads
+            self._parser = json.loads
         except ImportError:
             try:
                 import cjson
-                self.parser = cjson.decode
+                self._parser = cjson.decode
             except ImportError:
-                self.parser = eval
+                self._parser = eval
 
-        if self.user is None or self.passwd is None:
-            try:
-                try:
-                    fh = open (os.path.join (os.path.expanduser ('~'), '.vibliprc'), 'r')
-                    self.user   = fh.readline ().strip ()
-                    self.passwd = fh.readline ().strip ()
-                finally:
-                    fh.close ()
-            except:
-                pass
+        if self._login and self._password is not None:
+            import base64
+            self._headers['Authorization'] = 'Basic '+base64.encodestring (self._login + ':' + self._password)
 
-        self.headers     = {
-            'X-Blip-api':       '0.02',
-            'Accept':           'application/json',
-            'Content-type':     'application/json',
-            'User-Agent':       'ViBlip/' + self.version + ' (http://www.vim.org/scripts/script.php?script_id=2492)',
-            'Authorization':    'Basic ' + base64.encodestring ('%s:%s' % (self.user, self.passwd)).rstrip (),
-        }
+        self._ch = httplib.HTTPConnection ('api.blip.pl', port=httplib.HTTP_PORT)
 
-        self.connect ()
+    def __call__ (self, fn, *args, **kwargs):
+        return getattr (self, fn) (*args, **kwargs)
 
-    def connect (self):
-        self.conn = httplib.HTTPConnection('api.blip.pl', 80)
+    def __execute (self, method, args, kwargs):
+        ## build request data
+        req_data = method (*args, **kwargs)
 
-    def send (self):
-        msg = vim.eval ('a:1')
-        msg = '{"update": {"body": "%s"}}' % msg
+        ## play with request headers
+        headers = copy.deepcopy (self._headers)
+        headers['Content-Type'] = 'multipart/form-data'
+        if 'boundary' in req_data:
+            headers['Content-Type'] += '; boundary="' + req_data['boundary'] + '"'
+        if 'headers' in req_data:
+            headers.update (req_data['headers'])
 
-        try:
-            self.conn.request ('POST', '/updates', msg, self.headers)
-            response = self.conn.getresponse ()
+        req_body = req_data.get ('data', '')
+        headers['Content-Length'] = len (req_body)
 
-            if response.status not in (200, 201, 204):
-                print response.status, response.reason
-                return
+        self._ch.request (req_data['method'].upper (), req_data['url'], body=req_body, headers=headers)
+        response    = self._ch.getresponse ()
 
-            print 'Status OK:', response.getheader ('Location', '').replace ('/api.', '/').replace ('/updates/', '/s/')
-            return True
+        body_parsed = False
+        body        = response.read ()
+        if response.status in (200, 201, 204):
+            ## parser errors need to be handled in higher level (by blipapi.py user)
+            body        = self._parser (body)
+            body_parsed = True
 
-        except Exception, e:
-            print 'Error:', e
-            return False
-
-    def read (self, url):
-        self.conn.request ('GET', url, None, self.headers)
-        response = self.conn.getresponse ()
-        if response.status not in (200, 201, 204):
-            raise ViBlipError ((response.status, response.reason))
-
-        if response.getheader ('Content-Length', 0) <= 0:
-            raise ViBlipError ('Response empty')
-
-        reply = response.read ()
-        if not reply:
-            raise ViBlipError ('Response empty')
-
-        return self.parser (reply)
-
-    def _raw2utf (self, rematch):
-       return unichr (int ('0x' + rematch.group (0)[2:], 16))
-
-    def raw2utf (self, str):
-        return self.rxp_raw2utf.sub (self._raw2utf, str).encode ('utf-8')
-    def dashboard (self):
-        url = vim.eval ('a:1')
-        if url:
-            if url.isdigit ():
-                url = '/dashboard?limit=' + url
-            else:
-            	if '/' in url:
-                    url, limit = url.split ('/')
-                    url = '/users/' + url + '/dashboard?limit=' + limit
-                else:
-                    url = '/users/' + url + '/dashboard'
-        else:
-            url = '/dashboard'
-
-        try:
-            dboard = self.read (url)
-            if not dboard:
-                print 'Dashbard empty'
-                return
-
-            for status in dboard:
-                msg = '%s %s %s' % (status['created_at'], status['id'], status['user_path'].split ('/')[-1])
-                rcp = status.get ('recipient_path', '')
-                if rcp:
-                    msg += ' > ' + rcp.split ('/')[-1]
-                msg += ': %s' % self.raw2utf (status['body']).replace ('\\', '')
-                print msg
-
-        except ViBlipError, e:
-            print 'Dashbard empty'
-            return False
-        except Exception, e:
-            print 'Error:', e
-            return False
-
-    def private (self):
-        url = '/private_messages?limit='
-        if vim.eval ('a:1'):
-            url += vim.eval ('a:1')
-        else:
-            url += '5'
-
-        try:
-            pms = self.read (url)
-            if not pms:
-                print 'No private messages'
-                return False
-
-            for pm in pms:
-                msg = '%s %s >> %s: %s' % (
-                    pm['created_at'],
-                    pm['user_path'].split ('/')[-1],
-                    pm['recipient_path'].split ('/')[-1],
-                    self.raw2utf (pm['body']).replace ('\\', ''),
-                )
-                print msg
-
-        except ViBlipError, e:
-            print 'No private messages'
-            return False
-        except Exception, e:
-            print 'Error:', e
-            return False
-
-    def message (self):
-        #url = '/statuses/' + vim.eval ('a:1')
-        msg_types = dict (
-            pm = '/private_messages/',
-            dm = '/directed_messages/',
-            st = '/statuses/',
+        return dict (
+            # headers     = dict ([(k.lower (), v) for k, v in response.getheaders ()]),
+            body        = body,
+            body_parsed = body_parsed,
+            status_code = response.status,
+            status_body = response.reason,
         )
 
-        url = vim.eval ('a:1')
-        if '/' in url:
-            url, _type = url.split ('/')
-            if _type in msg_types:
-                url = msg_types[_type] + url
-            else:
-                print 'Unknown status type - should be one of: dm (direct message), pm (private message), st (status).'
-                return False
-        else:
-            url = '/statuses/' + url
+    def __getattr__ (self, fn):
+        if '_' not in fn:
+            raise AttributeError ('Command not found.')
+
+        module_name, method = fn.split ('_', 1)
 
         try:
-            message = self.read (url)
-            if not message:
-                print 'Status empty'
-                return False
+            module = self._modules[module_name]
+            method = getattr (module, method)
 
-            print '%s %s %s' % (
-                message['created_at'],
-                message['user_path'].split ('/')[-1],
-                self.raw2utf (message['body']).replace ('\\', '')
-            )
-
-        except ViBlipError, e:
-            print 'Status empty'
-            return False
+            if not callable (method):
+                raise AttributeError ('Command not found.')
         except Exception, e:
-            print 'Error:', e
-            return False
+            print e
+            raise AttributeError ('Command not found')
+
+        return lambda *args, **kwargs: self.__execute (method, args, kwargs)
+
+
+# from viblip import BlipApi
+# import viblip
+# viblip = reload (viblip)
+class ViBlip (object):
+    def __init__ (self):
+        try:
+            try:
+                fh = open (os.path.join (os.path.expanduser ('~'), '.vibliprc'), 'r')
+                login     = fh.readline ().strip ()
+                password  = fh.readline ().strip ()
+            finally:
+                fh.close ()
+        except:
+            pass
+
+        self.__blip = BlipApi (login, password)
+
+    def dashboard_read (self, limit=3):
+        try:
+            d = self.__blip.dashboard_read (limit=limit)
+            if d['status_code'] in (200, 201, 204):
+                print d['body']
+            else:
+                raise BlipApiError ('[%d] %s' % (d['status_code'], d['status_body']))
+        except BlipApiError, e:
+            print e
 
 viblip = ViBlip ()
-
 EOF
 
-function! ViBlipSend(...)
-    python viblip.send()
-endfunction
-command! -nargs=1 Blip call ViBlipSend (<q-args>)
+" function! ViBlipInit ()
+"     python viblip = ViBlip ()
+" endfunction
 
-function! ViBlipDasboard(...)
-    python viblip.dashboard()
+function! ViBlipDashboard ()
+    python viblip.dashboard_read ()
 endfunction
-command! -nargs=? DBlip call ViBlipDasboard (<q-args>)
 
-function! ViBlipPrivateMessages(...)
-    python viblip.private()
+function! ViBlipTest ()
+    python << EOF
+h = httplib.HTTPConnection ('urzenia.net')
+h.request ('get', '/')
+q = h.getresponse ()
+print type (q), dir (q)
+print q.msg.readheaders ()
+EOF
 endfunction
-command! -nargs=? PBlip call ViBlipPrivateMessages (<q-args>)
-
-function! ViBlipMessage(...)
-    python viblip.message()
-endfunction
-command! -nargs=1 MBlip call ViBlipMessage (<q-args>)
-
-function! ViBlipReconnect()
-    python viblip.connect()
-endfunction
-command! -nargs=0 RBlip call ViBlipReconnect ()
-
-endif
